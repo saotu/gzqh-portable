@@ -6,4 +6,3 @@ curl -fsSL -o gzqh-portable.zip https://github.com/saotu/gzqh-portable/releases/
 unzip -q -o gzqh-portable.zip
 cd gzqh-portable
 bash install.sh
-exec gzqh
