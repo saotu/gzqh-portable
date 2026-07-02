@@ -74,7 +74,7 @@ EOF
 }
 EOF
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE" || true
-  echo 'Fresh install completed. Persistent systemd service created and enabled.'
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  echo 'Fresh install completed. Persistent systemd service created and enabled on boot, but not started yet.'
   echo 'Install finished. Run: gzqh'
 fi

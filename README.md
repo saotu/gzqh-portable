@@ -14,23 +14,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/saotu/gzqh-portable/main/lau
 curl -fsSL https://raw.githubusercontent.com/saotu/gzqh-portable/main/install-online.sh | bash
 ```
 
-After install, run:
-
-```bash
-gzqh
-```
-
-## Uninstall
-
-```bash
-bash uninstall.sh
-```
-
-Persistence:
-- Fresh install automatically creates and enables a persistent systemd service.
-
-Menu uninstall:
-- Inside `gzqh`, choose `99) 一键卸载`.
+Fresh install behavior:
+- A persistent systemd service is created and enabled on boot.
+- It is **not started immediately** on first install.
+- Open `gzqh`, finish config, then use `7) 服务控制` to start it.
 
 Reinstall behavior:
-- If an older version already exists, program files are replaced but your current service parameters stay unchanged.
+- Program files are replaced.
+- Existing service parameters stay unchanged.
+
+Uninstall:
+- Inside `gzqh`, choose `99) 一键卸载`.
+- Or run `bash uninstall.sh`.
