@@ -16,17 +16,14 @@ curl -fsSL https://raw.githubusercontent.com/saotu/gzqh-portable/main/install-on
 
 Fresh install behavior:
 - A persistent systemd service is created and enabled on boot.
-- It is **not started immediately** on first install.
+- It is not started immediately on first install.
 - Open `gzqh`, finish config, then use `7) 服务控制` to start it.
 
 Reinstall behavior:
 - Program files are replaced.
 - Existing service parameters stay unchanged.
 
-Uninstall:
-- Inside `gzqh`, choose `99) 一键卸载`.
-- Or run `bash uninstall.sh`.
-
-
-Debug tip:
-- The launcher prints the installed `gzqh` path and key menu markers before opening the menu.
+Menu shortcuts:
+- `7) 服务控制（启动/停止/重启/状态）`
+- `88) 一键更新`
+- `99) 一键卸载`
