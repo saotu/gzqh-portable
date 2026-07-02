@@ -26,3 +26,7 @@ Reinstall behavior:
 Uninstall:
 - Inside `gzqh`, choose `99) 一键卸载`.
 - Or run `bash uninstall.sh`.
+
+
+Debug tip:
+- The launcher prints the installed `gzqh` path and key menu markers before opening the menu.
