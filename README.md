@@ -2,20 +2,21 @@
 
 Portable, sanitized `gzqh` failover package.
 
-## One-line install
+## One-line install and open menu
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/saotu/gzqh-portable/main/launch.sh)
+```
+
+## Install only
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/saotu/gzqh-portable/main/install-online.sh | bash
 ```
 
-This installs and immediately starts `gzqh`.
-
-## Offline install
+After install, run:
 
 ```bash
-unzip gzqh-portable.zip
-cd gzqh-portable
-bash install.sh
 gzqh
 ```
 
@@ -25,17 +26,11 @@ gzqh
 bash uninstall.sh
 ```
 
-
-Reinstall behavior:
-- If an older version already exists, install.sh replaces program files but keeps your current service parameters unchanged.
-
-
 Persistence:
 - Fresh install automatically creates and enables a persistent systemd service.
 
 Menu uninstall:
 - Inside `gzqh`, choose `99) 一键卸载`.
 
-
-Note:
-- Using `curl | bash` installs everything first. If your shell is non-interactive, run `gzqh` manually after install.
+Reinstall behavior:
+- If an older version already exists, program files are replaced but your current service parameters stay unchanged.
