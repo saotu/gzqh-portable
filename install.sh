@@ -29,11 +29,7 @@ if [ -n "$TMP_BACKUP" ] && [ -f "$TMP_BACKUP" ]; then
   systemctl restart "$SERVICE" || true
   systemctl enable "$SERVICE" >/dev/null 2>&1 || true
   echo 'Updated existing installation. Existing service parameters were preserved.'
-  if [ -t 0 ] && [ -t 1 ]; then
-    exec gzqh
-  else
-    echo 'Install finished. Run: gzqh'
-  fi
+  echo 'Install finished. Run: gzqh'
 else
   cat > "$SERVICE_FILE" <<'EOF'
 [Unit]
@@ -80,9 +76,5 @@ EOF
   systemctl daemon-reload
   systemctl enable --now "$SERVICE" || true
   echo 'Fresh install completed. Persistent systemd service created and enabled.'
-  if [ -t 0 ] && [ -t 1 ]; then
-    exec gzqh
-  else
-    echo 'Install finished. Run: gzqh'
-  fi
+  echo 'Install finished. Run: gzqh'
 fi

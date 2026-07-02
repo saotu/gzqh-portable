@@ -6,9 +6,3 @@ curl -fsSL -o gzqh-portable.zip https://github.com/saotu/gzqh-portable/releases/
 unzip -q -o gzqh-portable.zip
 cd gzqh-portable
 bash install.sh
-if [ -t 0 ] && [ -t 1 ]; then
-  exec gzqh
-else
-  echo 'Install completed.'
-  echo 'Start menu with: gzqh'
-fi
