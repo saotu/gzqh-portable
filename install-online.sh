@@ -6,4 +6,9 @@ curl -fsSL -o gzqh-portable.zip https://github.com/saotu/gzqh-portable/releases/
 unzip -q -o gzqh-portable.zip
 cd gzqh-portable
 bash install.sh
-printf '\nInstalled. Start with:\n  gzqh\n'
+printf '
+Installed. Start with:
+  gzqh
+Uninstall with:
+  bash uninstall.sh
+'

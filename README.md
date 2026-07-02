@@ -16,3 +16,9 @@ cd gzqh-portable
 bash install.sh
 gzqh
 ```
+
+## Uninstall
+
+```bash
+bash uninstall.sh
+```
