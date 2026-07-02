@@ -35,3 +35,7 @@ Persistence:
 
 Menu uninstall:
 - Inside `gzqh`, choose `99) 一键卸载`.
+
+
+Note:
+- Using `curl | bash` installs everything first. If your shell is non-interactive, run `gzqh` manually after install.

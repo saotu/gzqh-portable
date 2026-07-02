@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SERVICE=ss-failover
 SERVICE_FILE=/etc/systemd/system/ss-failover.service
 SCRIPT_FILE=/opt/cf_ss_failover.py
 BIN_FILE=/usr/local/bin/gzqh
+LOGROTATE_FILE=/etc/logrotate.d/ss-failover
 TMP_BACKUP=""
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -22,29 +24,65 @@ mkdir -p /opt/ss-failover
 
 if [ -n "$TMP_BACKUP" ] && [ -f "$TMP_BACKUP" ]; then
   cp -a "$TMP_BACKUP" "$SERVICE_FILE"
-  systemctl daemon-reload || true
-  systemctl restart ss-failover || true
   rm -f "$TMP_BACKUP"
-  cat <<'EOF'
-Updated existing installation.
-Program files were replaced, existing service parameters were preserved.
-
-Start with:
-  gzqh
-
-Uninstall with:
-  bash uninstall.sh
-EOF
+  systemctl daemon-reload || true
+  systemctl restart "$SERVICE" || true
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  echo 'Updated existing installation. Existing service parameters were preserved.'
+  if [ -t 0 ] && [ -t 1 ]; then
+    exec gzqh
+  else
+    echo 'Install finished. Run: gzqh'
+  fi
 else
-  cat <<'EOF'
-Installed program files.
+  cat > "$SERVICE_FILE" <<'EOF'
+[Unit]
+Description=NFT failover for fixed entry port 10001
+After=network-online.target
+Wants=network-online.target
 
-No existing service config was found.
-Start with:
-  gzqh
-Then run install/repair from the menu to generate initial service config.
+[Service]
+Type=simple
+Environment=CHECK_TIMEOUT=0.06
+Environment=CHECK_INTERVAL=0.4
+Environment=FAIL_THRESHOLD=1
+Environment=FORWARD_PORT=10001
+Environment=BACKUP_CHECK_INTERVAL=1
+Environment=RECOVER_INTERVAL=1
+Environment=RECOVER_THRESHOLD=10
+Environment=BACKUP_HOST=127.0.0.1
+Environment=BACKUP_PORT=10001
+Environment=BACKUP_LIST=127.0.0.1:10001
+Environment=PRIMARY_STABLE_COUNT=3
+Environment=NFT_FAMILY=ip
+Environment=NFT_TABLE=nat
+Environment=NFT_CHAIN=prerouting
+Environment=NFT_POSTROUTING_CHAIN=postrouting
+ExecStart=/usr/bin/python3 /opt/cf_ss_failover.py
+Restart=always
+RestartSec=5
 
-Uninstall with:
-  bash uninstall.sh
+[Install]
+WantedBy=multi-user.target
 EOF
+  cat > "$LOGROTATE_FILE" <<'EOF'
+/opt/ss-failover/failover.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0644 root root
+}
+EOF
+  systemctl daemon-reload
+  systemctl enable --now "$SERVICE" || true
+  echo 'Fresh install completed. Persistent systemd service created and enabled.'
+  if [ -t 0 ] && [ -t 1 ]; then
+    exec gzqh
+  else
+    echo 'Install finished. Run: gzqh'
+  fi
 fi
