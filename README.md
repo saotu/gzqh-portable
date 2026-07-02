@@ -8,6 +8,8 @@ Portable, sanitized `gzqh` failover package.
 curl -fsSL https://raw.githubusercontent.com/saotu/gzqh-portable/main/install-online.sh | bash
 ```
 
+This installs and immediately starts `gzqh`.
+
 ## Offline install
 
 ```bash
