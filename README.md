@@ -5,7 +5,7 @@ Portable, sanitized `gzqh` failover package.
 ## One-line install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yipengnbb/gzqh-portable/main/install-online.sh | bash
+curl -fsSL https://raw.githubusercontent.com/saotu/gzqh-portable/main/install-online.sh | bash
 ```
 
 ## Offline install
