@@ -27,3 +27,10 @@ Menu shortcuts:
 - `7) 服务控制（启动/停止/重启/状态）`
 - `88) 一键更新`
 - `99) 一键卸载`
+
+## Changelog
+
+### 2026-07-15
+- Fix: while traffic is on backup, **primary OK is counted even if every backup is FAIL**.
+- Before this fix, backup-to-backup rotation `return`ed early and **reset/starved `recover_count`**, so the line could stay on backup forever despite continuous primary OK.
+- Fix: sleep interval uses `active.startswith('backup')` so `backup:0` / `backup:1` use `BACKUP_CHECK_INTERVAL`.

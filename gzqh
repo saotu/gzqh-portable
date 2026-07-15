@@ -1,0 +1,1160 @@
+#!/usr/bin/env bash
+set -u
+
+SERVICE="ss-failover"
+
+write_failover_script() {
+  mkdir -p /opt/ss-failover
+  cat > "$SCRIPT_FILE" <<'PYFAILOVER'
+#!/usr/bin/env python3
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_FILE = Path(os.getenv('STATE_FILE', '/opt/ss-failover/state.json'))
+LOG_FILE = Path(os.getenv('LOG_FILE', '/opt/ss-failover/failover.log'))
+
+FORWARD_PORT = int(os.getenv('FORWARD_PORT', '10001'))
+CHECK_TIMEOUT = float(os.getenv('CHECK_TIMEOUT', '3'))
+CHECK_INTERVAL = float(os.getenv('CHECK_INTERVAL', '1'))
+RECOVER_INTERVAL = float(os.getenv('RECOVER_INTERVAL', '2'))
+BACKUP_CHECK_INTERVAL = float(os.getenv('BACKUP_CHECK_INTERVAL', str(RECOVER_INTERVAL)))
+FAIL_THRESHOLD = int(os.getenv('FAIL_THRESHOLD', '3'))
+RECOVER_THRESHOLD = int(os.getenv('RECOVER_THRESHOLD', '5'))
+
+BACKUP_HOST = os.getenv('BACKUP_HOST', os.getenv('BACKUP_IP', 'BACKUP_HOST_PLACEHOLDER'))
+BACKUP_PORT = int(os.getenv('BACKUP_PORT', str(FORWARD_PORT)))
+
+
+def parse_backups():
+    raw = os.getenv('BACKUP_LIST', '').strip()
+    items = []
+    if raw:
+        for part in raw.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if ':' not in part:
+                raise RuntimeError(f'invalid BACKUP_LIST item: {part}')
+            host, port = part.rsplit(':', 1)
+            items.append([host.strip(), int(port)])
+    if not items:
+        items.append([BACKUP_HOST, BACKUP_PORT])
+    return items
+
+
+BACKUPS = parse_backups()
+BACKUP_HOST, BACKUP_PORT = BACKUPS[0]
+PRIMARY_STABLE_COUNT = int(os.getenv('PRIMARY_STABLE_COUNT', '3'))
+
+NFT_FAMILY = os.getenv('NFT_FAMILY', 'ip')
+NFT_TABLE = os.getenv('NFT_TABLE', 'nat')
+NFT_CHAIN = os.getenv('NFT_CHAIN', 'prerouting')
+NFT_POSTROUTING_CHAIN = os.getenv('NFT_POSTROUTING_CHAIN', 'postrouting')
+
+RULE_PATTERNS = {
+    'tcp': re.compile(rf'tcp dport {FORWARD_PORT}\b.*?dnat to ([0-9.]+):(\d+)'),
+    'udp': re.compile(rf'udp dport {FORWARD_PORT}\b.*?dnat to ([0-9.]+):(\d+)'),
+}
+POSTROUTING_PATTERNS = {
+    'tcp': re.compile(r'ip daddr ([0-9.]+) tcp dport (\d+) .*?masquerade'),
+    'udp': re.compile(r'ip daddr ([0-9.]+) udp dport (\d+) .*?masquerade'),
+}
+HANDLE_RE = re.compile(r'handle (\d+)$')
+
+
+def log(msg):
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    line = f'[{ts}] {msg}'
+    print(line, flush=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open('a', encoding='utf-8') as f:
+        f.write(line + '\n')
+
+
+def default_state():
+    return {
+        'active': 'primary',
+        'fail_count': 0,
+        'recover_count': 0,
+        'last_change': 0,
+        'primary_target': None,
+        'primary_seen_count': 0,
+        'backup_index': 0,
+    }
+
+
+def load_state():
+    state = default_state()
+    if not STATE_FILE.exists():
+        return state
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding='utf-8'))
+        if isinstance(data, dict):
+            state.update(data)
+    except Exception:
+        pass
+    return state
+
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=True, indent=2), encoding='utf-8')
+
+
+def tcp_ok(host, port, timeout=None):
+    if timeout is None:
+        timeout = CHECK_TIMEOUT
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        sock.close()
+
+
+def run_nft(*args, check=True):
+    return subprocess.run(['nft', *args], text=True, capture_output=True, timeout=5, check=check)
+
+
+def list_chain(chain):
+    return run_nft('-a', 'list', 'chain', NFT_FAMILY, NFT_TABLE, chain).stdout
+
+
+def parse_forward_rules(text):
+    rules = {'tcp': None, 'udp': None}
+    for line in text.splitlines():
+        stripped = line.strip()
+        handle_match = HANDLE_RE.search(stripped)
+        handle = handle_match.group(1) if handle_match else None
+        for proto in ('tcp', 'udp'):
+            if rules[proto] is not None:
+                continue
+            if f'{proto} dport {FORWARD_PORT}' not in stripped or 'dnat to' not in stripped:
+                continue
+            match = RULE_PATTERNS[proto].search(stripped)
+            if match:
+                rules[proto] = {
+                    'host': match.group(1),
+                    'port': int(match.group(2)),
+                    'line': stripped,
+                    'handle': handle,
+                }
+    return rules
+
+
+def parse_postrouting_rules(text):
+    seen = {'tcp': [], 'udp': []}
+    for line in text.splitlines():
+        stripped = line.strip()
+        handle_match = HANDLE_RE.search(stripped)
+        handle = handle_match.group(1) if handle_match else None
+        for proto in ('tcp', 'udp'):
+            match = POSTROUTING_PATTERNS[proto].search(stripped)
+            if match:
+                seen[proto].append({
+                    'host': match.group(1),
+                    'port': int(match.group(2)),
+                    'line': stripped,
+                    'handle': handle,
+                })
+    return seen
+
+
+def get_current_rules():
+    try:
+        return parse_forward_rules(list_chain(NFT_CHAIN))
+    except Exception as e:
+        log(f'nft rule read failed: {e}')
+        return {'tcp': None, 'udp': None}
+
+
+def get_postrouting_rules():
+    try:
+        return parse_postrouting_rules(list_chain(NFT_POSTROUTING_CHAIN))
+    except Exception as e:
+        log(f'postrouting read failed: {e}')
+        return {'tcp': [], 'udp': []}
+
+
+def add_postrouting_rule(proto, host, port):
+    run_nft(
+        'add', 'rule', NFT_FAMILY, NFT_TABLE, NFT_POSTROUTING_CHAIN,
+        'ip', 'daddr', host, proto, 'dport', str(port), 'masquerade',
+        check=False,
+    )
+
+
+def ensure_postrouting_unique(host, port):
+    rules = get_postrouting_rules()
+    for proto in ('tcp', 'udp'):
+        matches = [r for r in rules[proto] if r['host'] == host and r['port'] == port]
+        if not matches:
+            add_postrouting_rule(proto, host, port)
+            continue
+        keep = matches[0]['handle']
+        for dup in matches[1:]:
+            if dup['handle']:
+                run_nft('delete', 'rule', NFT_FAMILY, NFT_TABLE, NFT_POSTROUTING_CHAIN, 'handle', str(dup['handle']), check=False)
+                log(f'removed duplicate postrouting {proto} {host}:{port} handle={dup["handle"]}')
+
+
+def add_forward_rule(proto, host, port):
+    run_nft(
+        'insert', 'rule', NFT_FAMILY, NFT_TABLE, NFT_CHAIN,
+        proto, 'dport', str(FORWARD_PORT), 'counter', 'dnat', 'to', f'{host}:{port}',
+    )
+
+
+def delete_rule(chain, handle):
+    if not handle:
+        raise RuntimeError('missing nft rule handle')
+    run_nft('delete', 'rule', NFT_FAMILY, NFT_TABLE, chain, 'handle', str(handle))
+
+
+def switch_target(new_host, new_port):
+    rules = get_current_rules()
+    tcp_rule = rules['tcp']
+    udp_rule = rules['udp']
+    if not tcp_rule:
+        raise RuntimeError(f'tcp dport {FORWARD_PORT} rule not found')
+
+    add_forward_rule('tcp', new_host, new_port)
+    delete_rule(NFT_CHAIN, tcp_rule['handle'])
+
+    if udp_rule:
+        add_forward_rule('udp', new_host, new_port)
+        delete_rule(NFT_CHAIN, udp_rule['handle'])
+
+    ensure_postrouting_unique(new_host, new_port)
+
+
+def refresh_primary_target(state, current_host, current_port):
+    current = [current_host, current_port]
+    if current in BACKUPS:
+        state['primary_seen_count'] = 0
+        return
+    prev = state.get('primary_target')
+    if prev == current:
+        state['primary_seen_count'] = min(state.get('primary_seen_count', 0) + 1, PRIMARY_STABLE_COUNT)
+    else:
+        state['primary_target'] = current
+        state['primary_seen_count'] = 1
+        log(f'learn primary target={current_host}:{current_port}')
+
+
+def health_ok(host, port, label):
+    ok = tcp_ok(host, port, CHECK_TIMEOUT)
+    log(f'{label}->{host}:{port} ' + ('OK' if ok else 'FAIL'))
+    return ok
+
+
+def run_once(state):
+    rules = get_current_rules()
+    tcp_rule = rules['tcp']
+    udp_rule = rules['udp']
+    if not tcp_rule:
+        raise RuntimeError(f'nft rule missing for tcp dport {FORWARD_PORT}')
+    if not udp_rule:
+        log(f'warning: udp dport {FORWARD_PORT} rule missing')
+
+    current_host = tcp_rule['host']
+    current_port = tcp_rule['port']
+    refresh_primary_target(state, current_host, current_port)
+
+    primary = state.get('primary_target')
+    if not primary:
+        raise RuntimeError('primary target not learned yet')
+    primary_host, primary_port = primary
+
+    manual_hold = state.get('manual_hold')
+    if manual_hold == 'backup':
+        idx = int(state.get('backup_index', 0))
+        idx = max(0, min(idx, len(BACKUPS) - 1))
+        hold_host, hold_port = BACKUPS[idx]
+        if [current_host, current_port] != [hold_host, hold_port]:
+            switch_target(hold_host, hold_port)
+            current_host, current_port = hold_host, hold_port
+            log(f'=== MANUAL HOLD BACKUP#{idx + 1} {hold_host}:{hold_port} ===')
+        state['active'] = f'backup:{idx}'
+        state['fail_count'] = 0
+        state['recover_count'] = 0
+        health_ok(primary_host, primary_port, 'primary-probe')
+        ensure_postrouting_unique(hold_host, hold_port)
+        log('manual hold: backup active, auto recovery disabled')
+        save_state(state)
+        return
+
+    current_backup_index = next((i for i, b in enumerate(BACKUPS) if b == [current_host, current_port]), None)
+    active_is_backup = current_backup_index is not None
+    if active_is_backup:
+        state['active'] = f'backup:{current_backup_index}'
+        state['backup_index'] = current_backup_index
+    else:
+        state['active'] = 'primary'
+
+    if not active_is_backup:
+        ok = health_ok(current_host, current_port, 'primary')
+        state['recover_count'] = 0
+        if ok:
+            state['fail_count'] = 0
+            ensure_postrouting_unique(current_host, current_port)
+        else:
+            state['fail_count'] = state.get('fail_count', 0) + 1
+            log(f"fail_count={state['fail_count']}/{FAIL_THRESHOLD}")
+            if state['fail_count'] >= FAIL_THRESHOLD:
+                backup_host, backup_port = BACKUPS[0]
+                switch_target(backup_host, backup_port)
+                state['active'] = 'backup:0'
+                state['backup_index'] = 0
+                state['fail_count'] = 0
+                state['recover_count'] = 0
+                state['last_change'] = int(time.time())
+                log(f'=== SWITCH NFT -> BACKUP#1 {backup_host}:{backup_port} ===')
+    else:
+        # Prefer primary recovery. Never let backup rotation starve recover_count.
+        primary_ok = health_ok(primary_host, primary_port, 'primary-probe')
+        state['fail_count'] = 0
+        if primary_ok:
+            state['recover_count'] = state.get('recover_count', 0) + 1
+            log(f"recover_count={state['recover_count']}/{RECOVER_THRESHOLD}")
+            if state['recover_count'] >= RECOVER_THRESHOLD:
+                switch_target(primary_host, primary_port)
+                state['active'] = 'primary'
+                state['recover_count'] = 0
+                state['last_change'] = int(time.time())
+                ensure_postrouting_unique(primary_host, primary_port)
+                log(f'=== SWITCH NFT -> PRIMARY {primary_host}:{primary_port} ===')
+                save_state(state)
+                return
+            # Primary recovering but threshold not met: stay/rotate backup without clearing recover_count
+            backup_host, backup_port = BACKUPS[current_backup_index or 0]
+            backup_ok = health_ok(backup_host, backup_port, f'backup#{(current_backup_index or 0) + 1}')
+            ensure_postrouting_unique(backup_host, backup_port)
+            if not backup_ok and len(BACKUPS) > 1:
+                next_idx = ((current_backup_index or 0) + 1) % len(BACKUPS)
+                next_host, next_port = BACKUPS[next_idx]
+                switch_target(next_host, next_port)
+                state['active'] = f'backup:{next_idx}'
+                state['backup_index'] = next_idx
+                state['last_change'] = int(time.time())
+                ensure_postrouting_unique(next_host, next_port)
+                log(
+                    f'=== SWITCH NFT -> BACKUP#{next_idx + 1} {next_host}:{next_port} '
+                    f'(primary recovering, keep recover_count={state["recover_count"]}) ==='
+                )
+        else:
+            state['recover_count'] = 0
+            log('backup active, primary unhealthy')
+            backup_host, backup_port = BACKUPS[current_backup_index or 0]
+            backup_ok = health_ok(backup_host, backup_port, f'backup#{(current_backup_index or 0) + 1}')
+            ensure_postrouting_unique(backup_host, backup_port)
+            if not backup_ok and len(BACKUPS) > 1:
+                next_idx = ((current_backup_index or 0) + 1) % len(BACKUPS)
+                next_host, next_port = BACKUPS[next_idx]
+                switch_target(next_host, next_port)
+                state['active'] = f'backup:{next_idx}'
+                state['backup_index'] = next_idx
+                state['last_change'] = int(time.time())
+                ensure_postrouting_unique(next_host, next_port)
+                log(f'=== SWITCH NFT -> BACKUP#{next_idx + 1} {next_host}:{next_port} ===')
+
+    save_state(state)
+
+
+def main():
+    if '--once' in sys.argv:
+        run_once(load_state())
+        return
+
+    log(f'START port={FORWARD_PORT} backups=' + ','.join(f'{h}:{p}' for h, p in BACKUPS))
+    log(f'  fail: {CHECK_INTERVAL}s x{FAIL_THRESHOLD} | backup-check: {BACKUP_CHECK_INTERVAL}s | recover: {RECOVER_INTERVAL}s x{RECOVER_THRESHOLD}')
+    while True:
+        try:
+            state = load_state()
+            run_once(state)
+            active = str(state.get('active') or '')
+            interval = BACKUP_CHECK_INTERVAL if active.startswith('backup') else CHECK_INTERVAL
+        except Exception as e:
+            log(f'unhandled error: {e}')
+            interval = CHECK_INTERVAL
+        time.sleep(interval)
+
+
+if __name__ == '__main__':
+    main()
+PYFAILOVER
+  chmod +x "$SCRIPT_FILE"
+}
+
+write_logrotate_file() {
+  cat > "$LOGROTATE_FILE" <<'EOF'
+/opt/ss-failover/failover.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0644 root root
+}
+EOF
+}
+
+write_service_file() {
+  local backup_host="${1:-BACKUP_HOST_PLACEHOLDER}"
+  local backup_port="${2:-10001}"
+  local forward_port="${3:-10001}"
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=NFT failover for fixed entry port ${forward_port}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CHECK_TIMEOUT=0.06
+Environment=CHECK_INTERVAL=0.4
+Environment=FAIL_THRESHOLD=1
+Environment=FORWARD_PORT=${forward_port}
+Environment=BACKUP_CHECK_INTERVAL=1
+Environment=RECOVER_INTERVAL=1
+Environment=RECOVER_THRESHOLD=10
+Environment=BACKUP_HOST=${backup_host}
+Environment=BACKUP_PORT=${backup_port}
+Environment=BACKUP_LIST=${backup_host}:${backup_port}
+Environment=PRIMARY_STABLE_COUNT=3
+Environment=NFT_FAMILY=ip
+Environment=NFT_TABLE=nat
+Environment=NFT_CHAIN=prerouting
+Environment=NFT_POSTROUTING_CHAIN=postrouting
+ExecStart=/usr/bin/python3 $SCRIPT_FILE
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_or_repair() {
+  need_root
+  echo "安装/修复 gzqh 故障切换组件"
+  local backup_host backup_port backup_list forward_port
+  backup_host=$(get_env BACKUP_HOST "BACKUP_HOST_PLACEHOLDER")
+  backup_port=$(get_env BACKUP_PORT "10001")
+  backup_list=$(get_env BACKUP_LIST "${backup_host}:${backup_port}")
+  forward_port=$(get_env FORWARD_PORT "10001")
+  read -rp "入口端口 [${forward_port}]: " input_port
+  read -rp "备用列表 host:port,逗号分隔 [${backup_list}]: " input_blist
+  forward_port=${input_port:-$forward_port}
+  backup_list=${input_blist:-$backup_list}
+  backup_host=${backup_list%%:*}
+  first_item=${backup_list%%,*}
+  backup_host=${first_item%:*}
+  backup_port=${first_item##*:}
+
+  if ! command -v nft >/dev/null 2>&1; then
+    echo "缺少 nft，正在安装 nftables..."
+    apt-get update && apt-get install -y nftables
+  fi
+  systemctl enable --now nftables >/dev/null 2>&1 || true
+
+  [[ -f "$SCRIPT_FILE" ]] && cp -a "$SCRIPT_FILE" "$SCRIPT_FILE.bak_$(date +%Y%m%d_%H%M%S)"
+  [[ -f "$SERVICE_FILE" ]] && cp -a "$SERVICE_FILE" "$SERVICE_FILE.bak_$(date +%Y%m%d_%H%M%S)"
+  write_failover_script
+  write_service_file "$backup_host" "$backup_port" "$forward_port"
+  set_env BACKUP_LIST "$backup_list"
+  write_logrotate_file
+  python3 -m py_compile "$SCRIPT_FILE"
+  systemctl daemon-reload
+  systemctl enable --now "$SERVICE"
+  systemctl restart "$SERVICE"
+  echo
+  echo "安装/修复完成。当前状态："
+  systemctl status "$SERVICE" --no-pager -l | sed -n '1,40p'
+}
+SERVICE_FILE="/etc/systemd/system/ss-failover.service"
+SCRIPT_FILE="/opt/cf_ss_failover.py"
+STATE_FILE="/opt/ss-failover/state.json"
+LOG_FILE="/opt/ss-failover/failover.log"
+LOGROTATE_FILE="/etc/logrotate.d/ss-failover"
+
+color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
+info() { color 36 "$1"; }
+ok() { color 32 "$1"; }
+warn() { color 33 "$1"; }
+err() { color 31 "$1"; }
+pause() { read -rp $'\n按回车继续...' _; }
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "请用 root 运行"; exit 1; }; }
+
+get_env() {
+  local key="$1" default="${2:-}"
+  local val
+  val=$(grep -E "^Environment=${key}=" "$SERVICE_FILE" 2>/dev/null | tail -1 | sed -E "s/^Environment=${key}=//")
+  printf '%s' "${val:-$default}"
+}
+
+get_backup_list() {
+  local first
+  first="$(get_env BACKUP_HOST BACKUP_HOST_PLACEHOLDER):$(get_env BACKUP_PORT 10001)"
+  get_env BACKUP_LIST "$first"
+}
+
+first_backup_host() {
+  local first="${1%%,*}"
+  printf '%s' "${first%:*}"
+}
+
+first_backup_port() {
+  local first="${1%%,*}"
+  printf '%s' "${first##*:}"
+}
+
+
+set_env() {
+  local key="$1" val="$2"
+  if grep -qE "^Environment=${key}=" "$SERVICE_FILE"; then
+    sed -i -E "s|^Environment=${key}=.*|Environment=${key}=${val}|" "$SERVICE_FILE"
+  else
+    sed -i "/^\[Service\]/a Environment=${key}=${val}" "$SERVICE_FILE"
+  fi
+}
+
+reload_restart() {
+  systemctl daemon-reload
+  systemctl restart "$SERVICE"
+}
+
+show_header() {
+  clear
+  echo "============================================"
+  echo " gzqh - gzgg nft 四层故障切换管理 (入口: $(get_env FORWARD_PORT 10001))"
+  echo "============================================"
+}
+
+show_config() {
+  echo "服务文件: $SERVICE_FILE"
+  echo "脚本文件: $SCRIPT_FILE"
+  echo
+  local svc_state
+  svc_state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+  if [[ "$svc_state" == "active" ]]; then
+    ok "服务状态: 运行中 (active)"
+  else
+    warn "服务状态: 未运行 (${svc_state:-unknown})，请先到 7) 服务控制 启动"
+  fi
+  echo
+  printf '入口端口:       %s\n' "$(get_env FORWARD_PORT 10001)"
+  printf '备用线路:       %s\n' "$(get_backup_list)"
+  printf '故障检测:       %ss x %s 次\n' "$(get_env CHECK_INTERVAL 0.6)" "$(get_env FAIL_THRESHOLD 2)"
+  printf '备用探测:       %ss 一次\n' "$(get_env BACKUP_CHECK_INTERVAL $(get_env RECOVER_INTERVAL 1))"
+  printf '连接超时:       %ss\n' "$(get_env CHECK_TIMEOUT 3)"
+  printf '恢复检测:       %ss x %s 次\n' "$(get_env RECOVER_INTERVAL 1)" "$(get_env RECOVER_THRESHOLD 10)"
+  printf '日志轮转:       每日一清, 保留7份\n'
+}
+
+show_rules() {
+  echo "--- PREROUTING $(get_env FORWARD_PORT 10001) ---"
+  nft -a list chain ip nat prerouting 2>/dev/null | grep -E "(tcp|udp) dport $(get_env FORWARD_PORT 10001)\b|dnat to" | grep "dport $(get_env FORWARD_PORT 10001)" || true
+  echo
+  echo "--- POSTROUTING related ---"
+  local backups pattern
+  backups=$(get_backup_list)
+  pattern=$(printf '%s' "$backups" | sed 's/:/[[:space:]].*dport /g; s/,/|/g')
+  nft -a list chain ip nat postrouting 2>/dev/null | grep -E "${pattern}" || true
+}
+
+status_page() {
+  show_header
+  show_config
+  echo
+  echo "--- 服务状态 ---"
+  systemctl is-active "$SERVICE" >/dev/null 2>&1 && ok "运行中: active" || err "异常: $(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+  echo
+  echo "--- 当前状态文件 ---"
+  if [[ -f "$STATE_FILE" ]]; then
+    python3 -m json.tool "$STATE_FILE" 2>/dev/null || cat "$STATE_FILE"
+  else
+    warn "无状态文件: $STATE_FILE"
+  fi
+  echo
+  show_rules
+  echo
+  echo "--- 日志轮转 ---"
+  if [[ -f "$LOGROTATE_FILE" ]]; then
+    sed -n "1,40p" "$LOGROTATE_FILE"
+  else
+    warn "未找到 $LOGROTATE_FILE"
+  fi
+  pause
+}
+
+logs_page() {
+  show_header
+  echo "1) 最近 50 行日志"
+  echo "2) 实时跟踪日志 Ctrl+C 退出"
+  echo "3) systemd 状态"
+  echo "4) 立即执行一次日志轮转"
+  echo "0) 返回"
+  read -rp "请选择: " c
+  case "$c" in
+    1) tail -n 50 "$LOG_FILE" 2>/dev/null || true; pause ;;
+    2) tail -f "$LOG_FILE" ;;
+    3) systemctl status "$SERVICE" --no-pager -l; pause ;;
+    4) logrotate -fv "$LOGROTATE_FILE"; ls -lh /opt/ss-failover/failover.log* 2>/dev/null || true; pause ;;
+  esac
+}
+
+change_backup() {
+  while true; do
+    show_header
+    local old_list
+    old_list=$(get_backup_list)
+    IFS=',' read -ra arr <<< "$old_list"
+    echo "当前备用线路列表（越靠前优先级越高）："
+    local i=0
+    for item in "${arr[@]}"; do
+      i=$((i + 1))
+      echo "  ${i}. ${item}"
+    done
+    [[ $i -eq 0 ]] && echo "  （空）"
+    echo
+    echo "1) 添加备用线路"
+    echo "2) 删除备用线路"
+    echo "3) 调整优先级 / 置顶某条"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " action
+    case "$action" in
+      1)
+        local host port new_item new_list first first_host first_port
+        read -rp "备用 IP/域名: " host
+        read -rp "备用端口: " port
+        if [[ -z "$host" || -z "$port" ]]; then
+          warn "IP/域名和端口不能为空"
+          pause
+          continue
+        fi
+        new_item="${host}:${port}"
+        if [[ -n "$old_list" ]]; then
+          new_list="${old_list},${new_item}"
+        else
+          new_list="$new_item"
+        fi
+        first=${new_list%%,*}
+        first_host=${first%:*}
+        first_port=${first##*:}
+        set_env BACKUP_LIST "$new_list"
+        set_env BACKUP_HOST "$first_host"
+        set_env BACKUP_PORT "$first_port"
+        reload_restart
+        ok "已添加备用线路：${new_item}"
+        pause
+        ;;
+      2)
+        if [[ ${#arr[@]} -eq 0 || -z "$old_list" ]]; then
+          warn "当前没有备用线路可删除"
+          pause
+          continue
+        fi
+        local del new_list item first first_host first_port
+        read -rp "输入要删除的编号: " del
+        if ! [[ "$del" =~ ^[0-9]+$ ]] || (( del < 1 || del > ${#arr[@]} )); then
+          warn "编号无效"
+          pause
+          continue
+        fi
+        new_list=""
+        i=0
+        for item in "${arr[@]}"; do
+          i=$((i + 1))
+          [[ $i -eq $del ]] && continue
+          if [[ -z "$new_list" ]]; then new_list="$item"; else new_list="${new_list},${item}"; fi
+        done
+        if [[ -z "$new_list" ]]; then
+          warn "至少保留一条备用线路，未删除"
+          pause
+          continue
+        fi
+        first=${new_list%%,*}
+        first_host=${first%:*}
+        first_port=${first##*:}
+        set_env BACKUP_LIST "$new_list"
+        set_env BACKUP_HOST "$first_host"
+        set_env BACKUP_PORT "$first_port"
+        reload_restart
+        ok "已删除第 ${del} 条备用线路"
+        pause
+        ;;
+      3)
+        if [[ ${#arr[@]} -le 1 || -z "$old_list" ]]; then
+          warn "至少需要两条备用线路才能调整优先级"
+          pause
+          continue
+        fi
+        local top item new_list first first_host first_port
+        read -rp "输入要置顶的编号: " top
+        if ! [[ "$top" =~ ^[0-9]+$ ]] || (( top < 1 || top > ${#arr[@]} )); then
+          warn "编号无效"
+          pause
+          continue
+        fi
+        if (( top == 1 )); then
+          warn "该线路已经是最高优先级"
+          pause
+          continue
+        fi
+        new_list="${arr[$((top - 1))]}"
+        i=0
+        for item in "${arr[@]}"; do
+          i=$((i + 1))
+          [[ $i -eq $top ]] && continue
+          new_list="${new_list},${item}"
+        done
+        first=${new_list%%,*}
+        first_host=${first%:*}
+        first_port=${first##*:}
+        set_env BACKUP_LIST "$new_list"
+        set_env BACKUP_HOST "$first_host"
+        set_env BACKUP_PORT "$first_port"
+        reload_restart
+        ok "已将第 ${top} 条备用线路置顶为最高优先级"
+        pause
+        ;;
+      0) return ;;
+      *) warn "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+
+
+change_forward_port() {
+  show_header
+  local old_port new_port target_info target_host target_port rules_old rules_new
+  old_port=$(get_env FORWARD_PORT 10001)
+  echo "当前入口端口: ${old_port}"
+  echo
+  echo "说明：改入口端口时，会优先读取该端口现有 nfter/nft 转发目标作为主线。"
+  echo "例如新端口已有 nfter 转发，gzqh 会自动读取它的目标地址和目标端口。"
+  echo "确认后会接管该入口端口，并把读取到的目标作为新的主线。"
+  echo
+  read -rp "新入口端口 [回车取消]: " new_port
+  [[ -n "$new_port" ]] || return
+  if ! [[ "$new_port" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+    err "端口无效，必须是 1-65535"
+    pause
+    return
+  fi
+  if [[ "$new_port" == "$old_port" ]]; then
+    warn "入口端口没有变化"
+    pause
+    return
+  fi
+
+  target_info=$(python3 - "$new_port" <<'PYFIND'
+import re
+import subprocess
+import sys
+port = int(sys.argv[1])
+text = subprocess.run(['nft','-a','list','chain','ip','nat','prerouting'], text=True, capture_output=True, check=True).stdout
+handle_re = re.compile(r'handle (\d+)$')
+# 1) 单端口: tcp dport 10002 ... dnat to 1.2.3.4:PRIMARY_PORT_PLACEHOLDER
+single_re = re.compile(r'\b(tcp|udp) dport ' + re.escape(str(port)) + r'\b.*?dnat to ([0-9.]+):(\d+)')
+# 2) 端口段 map: tcp dport 41000-41100 ... dnat to 1.2.3.4:tcp dport map { 41000 : 45600, ... }
+range_map_re = re.compile(r'\b(tcp|udp) dport (\d+)-(\d+)\b.*?dnat to ([0-9.]+):(?:tcp|udp) dport map \{(.*?)\}')
+# 3) 端口段同端口直转: tcp dport 46600-46700 ... dnat to 1.2.3.4
+range_same_re = re.compile(r'\b(tcp|udp) dport (\d+)-(\d+)\b.*?dnat to ([0-9.]+)(?:\s|#|$)')
+
+candidates = []
+for line in text.splitlines():
+    s = line.strip()
+    h = handle_re.search(s)
+    handle = h.group(1) if h else ''
+    m = single_re.search(s)
+    if m:
+        candidates.append((0 if m.group(1) == 'tcp' else 1, m.group(1), m.group(2), int(m.group(3)), handle, s))
+        continue
+    m = range_map_re.search(s)
+    if m:
+        proto, start, end, host, body = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4), m.group(5)
+        if start <= port <= end:
+            mm = re.search(r'(?:^|[,\s])' + re.escape(str(port)) + r'\s*:\s*(\d+)(?:[,\s]|$)', body)
+            if mm:
+                candidates.append((2 if proto == 'tcp' else 3, proto, host, int(mm.group(1)), handle, s))
+        continue
+    m = range_same_re.search(s)
+    if m:
+        proto, start, end, host = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+        if start <= port <= end:
+            candidates.append((4 if proto == 'tcp' else 5, proto, host, port, handle, s))
+
+if not candidates:
+    sys.exit(2)
+candidates.sort(key=lambda x: x[0])
+_, proto, host, target_port, handle, line = candidates[0]
+# 输出 shell 可解析的一行：host port handle line
+print(host)
+print(target_port)
+print(line)
+PYFIND
+  )
+  if [[ $? -ne 0 || -z "$target_info" ]]; then
+    err "没有找到新入口端口 ${new_port} 对应的 nfter/nft 转发目标，不能自动接管。"
+    echo "请先用 nfter 给 ${new_port} 建好转发，或确认该端口已有 nft dnat 规则。"
+    pause
+    return
+  fi
+  target_host=$(printf '%s\n' "$target_info" | sed -n '1p')
+  target_port=$(printf '%s\n' "$target_info" | sed -n '2p')
+  rules_new=$(printf '%s\n' "$target_info" | sed -n '3,$p')
+  rules_old=$(nft -a list chain ip nat prerouting 2>/dev/null | grep -E "(tcp|udp) dport ${old_port}\b.*dnat to" || true)
+
+  echo "新入口 ${new_port} 读取到的 nfter/nft 主线目标：${target_host}:${target_port}"
+  echo "匹配规则："
+  printf '%s\n' "$rules_new"
+  echo
+  if [[ -n "$rules_old" ]]; then
+    echo "将移除旧 gzqh 入口 ${old_port} 规则："
+    printf '%s\n' "$rules_old"
+    echo
+  fi
+  warn "确认把 gzqh 入口改为 ${new_port}，并接管主线 ${target_host}:${target_port}？"
+  read -rp "确认请输入 y: " y
+  [[ "$y" == "y" ]] || return
+
+  python3 - "$old_port" "$new_port" "$target_host" "$target_port" <<'PYPORT'
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+old_port, new_port, target_host, target_port = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+family, table, chain = 'ip', 'nat', 'prerouting'
+text = subprocess.run(['nft','-a','list','chain',family,table,chain], text=True, capture_output=True, check=True).stdout
+handle_re = re.compile(r'handle (\d+)$')
+# 删除旧 gzqh 入口端口规则，以及新端口原 nfter 规则，避免重复命中
+old_exact = re.compile(r'\b(tcp|udp) dport ' + re.escape(old_port) + r'\b.*?dnat to ')
+new_exact = re.compile(r'\b(tcp|udp) dport ' + re.escape(new_port) + r'\b.*?dnat to ')
+handles = []
+for line in text.splitlines():
+    s = line.strip()
+    h = handle_re.search(s)
+    if not h:
+        continue
+    if old_exact.search(s) or new_exact.search(s):
+        handles.append(h.group(1))
+# 先插入 gzqh 新规则，再删旧 handle，尽量缩短空窗
+for proto in ('tcp','udp'):
+    subprocess.run(['nft','insert','rule',family,table,chain,proto,'dport',new_port,'counter','dnat','to',f'{target_host}:{target_port}'], check=True)
+for handle in handles:
+    subprocess.run(['nft','delete','rule',family,table,chain,'handle',handle], check=False)
+# 更新 state，让服务启动后直接知道新主线，避免沿用旧 primary_target
+state_path = Path('/opt/ss-failover/state.json')
+try:
+    st = json.loads(state_path.read_text()) if state_path.exists() else {}
+except Exception:
+    st = {}
+st.update({
+    'active': 'primary',
+    'primary_target': [target_host, int(target_port)],
+    'primary_seen_count': 3,
+    'fail_count': 0,
+    'recover_count': 0,
+    'backup_index': 0,
+    'last_change': int(time.time()),
+})
+st.pop('manual_hold', None)
+state_path.parent.mkdir(parents=True, exist_ok=True)
+state_path.write_text(json.dumps(st, ensure_ascii=True, indent=2))
+print(f'gzqh entry {old_port} -> {new_port}; primary={target_host}:{target_port}; removed_handles={handles}')
+PYPORT
+  set_env FORWARD_PORT "$new_port"
+  reload_restart
+  ok "入口端口已改为 ${new_port}，主线已读取为 ${target_host}:${target_port}，服务已重启"
+  show_rules
+  pause
+}
+change_fail_params() {
+  show_header
+  local ci ft ct
+  ci=$(get_env CHECK_INTERVAL 0.6)
+  ft=$(get_env FAIL_THRESHOLD 2)
+  ct=$(get_env CHECK_TIMEOUT 3)
+  echo "当前故障检测: ${ci}s x ${ft} 次, connect timeout=${ct}s"
+  read -rp "故障检测间隔秒 [回车保持 ${ci}]: " nci
+  read -rp "连续失败次数 [回车保持 ${ft}]: " nft
+  read -rp "TCP连接超时秒 [回车保持 ${ct}]: " nct
+  set_env CHECK_INTERVAL "${nci:-$ci}"
+  set_env FAIL_THRESHOLD "${nft:-$ft}"
+  set_env CHECK_TIMEOUT "${nct:-$ct}"
+  reload_restart
+  ok "已更新故障检测参数并重启服务"
+  pause
+}
+
+change_recover_params() {
+  show_header
+  local bi ri rt
+  bi=$(get_env BACKUP_CHECK_INTERVAL $(get_env RECOVER_INTERVAL 1))
+  ri=$(get_env RECOVER_INTERVAL 1)
+  rt=$(get_env RECOVER_THRESHOLD 10)
+  echo "当前备用探测: ${bi}s 一次"
+  echo "当前恢复检测: ${ri}s x ${rt} 次"
+  read -rp "备用探测间隔秒 [回车保持 ${bi}]: " nbi
+  read -rp "恢复检测间隔秒 [回车保持 ${ri}]: " nri
+  read -rp "连续恢复次数 [回车保持 ${rt}]: " nrt
+  set_env BACKUP_CHECK_INTERVAL "${nbi:-$bi}"
+  set_env RECOVER_INTERVAL "${nri:-$ri}"
+  set_env RECOVER_THRESHOLD "${nrt:-$rt}"
+  reload_restart
+  ok "已更新备用/恢复检测参数并重启服务"
+  pause
+}
+
+restart_service() {
+  while true; do
+    show_header
+    echo "服务控制"
+    echo
+    echo "1) 启动服务"
+    echo "2) 停止服务"
+    echo "3) 重启服务"
+    echo "4) 查看服务状态"
+    echo "0) 返回"
+    echo
+    read -rp "请选择: " c
+    case "$c" in
+      1)
+        systemctl start "$SERVICE"
+        systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+        systemctl status "$SERVICE" --no-pager -l | sed -n '1,30p'
+        pause ;;
+      2)
+        systemctl stop "$SERVICE" || true
+        systemctl status "$SERVICE" --no-pager -l | sed -n '1,20p' || true
+        pause ;;
+      3)
+        reload_restart
+        systemctl status "$SERVICE" --no-pager -l | sed -n '1,30p'
+        pause ;;
+      4)
+        systemctl status "$SERVICE" --no-pager -l | sed -n '1,30p'
+        pause ;;
+      0) return ;;
+      *) warn "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+run_once() {
+  show_header
+  python3 "$SCRIPT_FILE" --once
+  echo
+  show_rules
+  pause
+}
+
+force_backup() {
+  show_header
+  local backups idx selected host port count
+  backups=$(get_backup_list)
+  IFS=',' read -ra arr <<< "$backups"
+  echo "备用列表:"
+  count=0
+  for item in "${arr[@]}"; do
+    count=$((count + 1))
+    echo "  ${count}) ${item}"
+  done
+  read -rp "选择备用编号 [1]: " idx
+  idx=${idx:-1}
+  if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > count )); then
+    err "编号无效"
+    pause
+    return
+  fi
+  selected=${arr[$((idx - 1))]}
+  host=${selected%:*}
+  port=${selected##*:}
+  warn "将手动锁定到备用#${idx}: ${host}:${port}"
+  read -rp "确认请输入 y: " y
+  [[ "$y" == "y" ]] || return
+  python3 - <<PY
+import importlib.util
+spec = importlib.util.spec_from_file_location('fo', '$SCRIPT_FILE')
+fo = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fo)
+fo.switch_target('$host', int('$port'))
+st = fo.load_state()
+st['active']='backup:$((idx - 1))'; st['backup_index']=$((idx - 1)); st['manual_hold']='backup'; st['fail_count']=0; st['recover_count']=0; st['last_change']=int(__import__('time').time())
+fo.save_state(st)
+print('switched to backup#$idx: $host:$port')
+PY
+  show_rules
+  pause
+}
+
+force_primary() {
+  show_header
+  local primary
+  primary=$(python3 - <<PY
+import json, sys
+try:
+    st=json.load(open('$STATE_FILE'))
+    p=st.get('primary_target')
+    print(f'{p[0]}:{p[1]}' if p else '')
+except Exception:
+    print('')
+PY
+)
+  if [[ -z "$primary" ]]; then
+    err "状态文件里没有 primary_target，无法强制切主。请先让服务在主规则下学习一次。"
+    pause
+    return
+  fi
+  local host="${primary%:*}" port="${primary##*:}"
+  warn "将手动把入口 $(get_env FORWARD_PORT 10001) 切回主线: ${host}:${port}"
+  read -rp "确认请输入 y: " y
+  [[ "$y" == "y" ]] || return
+  python3 - <<PY
+import importlib.util, time
+spec = importlib.util.spec_from_file_location('fo', '$SCRIPT_FILE')
+fo = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fo)
+fo.switch_target('$host', int('$port'))
+st = fo.load_state()
+st['active']='primary'; st.pop('manual_hold', None); st['fail_count']=0; st['recover_count']=0; st['last_change']=int(time.time())
+fo.save_state(st)
+print('switched to primary: $host:$port')
+PY
+  show_rules
+  pause
+}
+
+auto_mode() {
+  show_header
+  python3 - <<'PYAUTO'
+import json
+path='/opt/ss-failover/state.json'
+try:
+    st=json.load(open(path))
+except Exception:
+    st={}
+st.pop('manual_hold', None)
+st['fail_count']=0
+st['recover_count']=0
+open(path,'w').write(json.dumps(st, ensure_ascii=True, indent=2))
+print('已恢复自动模式')
+PYAUTO
+  systemctl restart "$SERVICE"
+  systemctl status "$SERVICE" --no-pager -l | sed -n '1,35p'
+  pause
+}
+
+clean_duplicates() {
+  show_header
+  echo "执行一次脚本健康检查，会顺手清理相关 postrouting 重复 masquerade。"
+  python3 "$SCRIPT_FILE" --once || true
+  echo
+  show_rules
+  pause
+}
+
+
+
+update_self() {
+  show_header
+  warn "将从 GitHub release 下载最新包并覆盖更新，保留当前 service 参数。"
+  read -rp "确认请输入 yes: " ans
+  [[ "$ans" == "yes" ]] || return
+  local tmpdir
+  tmpdir=$(mktemp -d /tmp/gzqh-update.XXXXXX)
+  cd "$tmpdir"
+  curl -fsSL -o gzqh-portable.zip https://github.com/saotu/gzqh-portable/releases/latest/download/gzqh-portable.zip
+  unzip -q -o gzqh-portable.zip
+  cd gzqh-portable
+  bash install.sh
+  ok "更新完成"
+  pause
+}
+
+uninstall_all() {
+  show_header
+  warn "将卸载 gzqh / ss-failover，并删除 service、脚本、状态和日志轮转配置"
+  read -rp "确认请输入 yes: " ans
+  [[ "$ans" == "yes" ]] || return
+  systemctl stop "$SERVICE" 2>/dev/null || true
+  systemctl disable "$SERVICE" 2>/dev/null || true
+  rm -f "$SERVICE_FILE"
+  rm -f "$SCRIPT_FILE"
+  rm -f "$LOGROTATE_FILE"
+  rm -rf /opt/ss-failover
+  rm -f /usr/local/bin/gzqh
+  systemctl daemon-reload || true
+  systemctl reset-failed "$SERVICE" 2>/dev/null || true
+  ok "已卸载完成"
+  exit 0
+}
+
+main_menu() {
+  need_root
+  while true; do
+    show_header
+    show_config
+    echo
+    echo "1) 查看状态 + 当前 nft 规则"
+    echo "2) 查看/跟踪切换日志"
+    echo "3) 修改备用线路列表"
+    echo "4) 修改入口端口"
+    echo "5) 修改故障检测参数"
+    echo "6) 修改恢复检测参数"
+    echo "7) 服务控制（启动/停止/重启/状态）"
+    echo "8) 执行一次检测/清理去重"
+    echo "9) 手动强制切到备用"
+    echo "10) 手动强制切回主线/解除锁定"
+    echo "11) 恢复自动模式/解除手动锁定"
+    echo "88) 一键更新"
+    echo "99) 一键卸载"
+    echo "0) 退出"
+    echo
+    read -rp "请选择: " c
+    case "$c" in
+      1) status_page ;;
+      2) logs_page ;;
+      3) change_backup ;;
+      4) change_forward_port ;;
+      5) change_fail_params ;;
+      6) change_recover_params ;;
+      7) restart_service ;;
+      8) clean_duplicates ;;
+      9) force_backup ;;
+      10) force_primary ;;
+      11) auto_mode ;;
+      88) update_self ;;
+      99) uninstall_all ;;
+      0) exit 0 ;;
+      *) warn "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  install|repair|--install) install_or_repair; exit $? ;;
+  status) status_page; exit $? ;;
+  logs) tail -f "$LOG_FILE"; exit $? ;;
+esac
+
+if [[ ! -f "$SCRIPT_FILE" || ! -f "$SERVICE_FILE" ]]; then
+  warn "检测到组件未完整安装。可执行: gzqh install"
+fi
+
+main_menu "$@"
